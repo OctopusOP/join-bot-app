@@ -1,0 +1,8 @@
+# Saved data (contains your bot token and user IDs)
+settings.json
+subscribers.json
+file_ids.json
+*.tmp
+__pycache__/
+.venv/
+*.broken-*.json
