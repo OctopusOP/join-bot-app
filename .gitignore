@@ -2,6 +2,8 @@
 settings.json
 subscribers.json
 file_ids.json
+pending_approvals.json
+handled_requests.json
 *.tmp
 __pycache__/
 .venv/

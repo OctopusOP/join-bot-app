@@ -23,6 +23,7 @@ import json
 import shutil
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
@@ -137,7 +138,7 @@ def add_subscriber(user: Dict[str, Any], greeted: bool) -> None:
 
 
 def set_subscriber_status(user_id: int, status: str) -> None:
-    """'active' or 'blocked' (blocked = user blocked the bot)."""
+    """'active', 'blocked' (user blocked the bot) or 'unreachable' (bot may never message them)."""
     with _lock:
         subs = _read(SUBSCRIBERS_FILE, [])
         for s in subs:
@@ -162,6 +163,72 @@ def remember_file_id(key: str, file_id: str) -> None:
         ids = _read(FILE_IDS_FILE, {})
         ids[key] = file_id
         _write(FILE_IDS_FILE, ids)
+
+
+# ---------------- approvals waiting for a retry ----------------
+# When approving fails because of network trouble, the request is saved here
+# and retried (also after a restart: Telegram does not resend old requests).
+
+PENDING_FILE = APP_DIR / "pending_approvals.json"
+
+
+def load_pending_approvals() -> List[Dict[str, Any]]:
+    with _lock:
+        return [p for p in _read(PENDING_FILE, []) if isinstance(p, dict) and "user_id" in p]
+
+
+def queue_pending_approval(user_id: int, channel_id: int, name: str) -> bool:
+    """
+    Adds a failed approval, or schedules the next try of one already queued
+    (waiting longer each time: 30 s, 1 min, 2 min … max 10 min).
+    Returns True when it was NOT queued before (first failure).
+    """
+    now = time.time()
+    with _lock:
+        pending = [p for p in _read(PENDING_FILE, []) if isinstance(p, dict) and "user_id" in p]
+        entry = next((p for p in pending if p["user_id"] == user_id), None)
+        first = entry is None
+        if first:
+            entry = {"user_id": user_id, "channel_id": channel_id, "name": name, "since": now, "tries": 0}
+            pending.append(entry)
+        entry["tries"] = entry.get("tries", 0) + 1
+        entry["next_try"] = now + min(30 * 2 ** (entry["tries"] - 1), 600)
+        _write(PENDING_FILE, pending)
+    return first
+
+
+def due_pending_approvals(now: float) -> List[Dict[str, Any]]:
+    """Queued approvals whose next try is due, oldest first."""
+    due = [p for p in load_pending_approvals() if p.get("next_try", 0) <= now]
+    return sorted(due, key=lambda p: p.get("since", 0))
+
+
+def drop_pending_approval(user_id: int) -> None:
+    with _lock:
+        pending = _read(PENDING_FILE, [])
+        kept = [p for p in pending if isinstance(p, dict) and p.get("user_id") != user_id]
+        if len(kept) != len(pending):
+            _write(PENDING_FILE, kept)
+
+
+# ---------------- join requests already handled ----------------
+# Remembers the last few hundred requests (channel:user:date) so a request
+# Telegram delivers again after a restart isn't greeted/approved twice.
+
+HANDLED_FILE = APP_DIR / "handled_requests.json"
+HANDLED_KEEP = 500
+
+
+def was_request_handled(key: str) -> bool:
+    with _lock:
+        return key in _read(HANDLED_FILE, [])
+
+
+def mark_request_handled(key: str) -> None:
+    with _lock:
+        keys = [k for k in _read(HANDLED_FILE, []) if k != key]
+        keys.append(key)
+        _write(HANDLED_FILE, keys[-HANDLED_KEEP:])
 
 
 def remove_subscribers(user_ids: List[int]) -> None:

@@ -33,13 +33,38 @@ except ImportError:
     SSL_CONTEXT = ssl.create_default_context()
 
 
+# Some servers get an IPv6 address for api.telegram.org but can't actually reach
+# it over IPv6; then every call first waits for the IPv6 attempt to time out.
+# Start with  JOINBOT_IPV4=1  (e.g. `JOINBOT_IPV4=1 bash start.sh --server`)
+# to connect over IPv4 only. `python3 server.py --check` shows if you need it.
+if os.environ.get("JOINBOT_IPV4", "").strip() in ("1", "true", "yes"):
+    _system_getaddrinfo = socket.getaddrinfo
+
+    def _ipv4_first(host, *args, **kwargs):
+        results = _system_getaddrinfo(host, *args, **kwargs)
+        return [r for r in results if r[0] == socket.AF_INET] or results
+
+    socket.getaddrinfo = _ipv4_first
+
+
 class TelegramError(Exception):
     """Raised when Telegram answers with ok=false (or the network fails)."""
 
-    def __init__(self, message: str, code: Optional[int] = None, retry_after: int = 0):
+    def __init__(self, message: str, code: Optional[int] = None, retry_after: int = 0,
+                 network: bool = False, maybe_sent: bool = False):
         super().__init__(message)
         self.code = code                # e.g. 403 = user blocked the bot, 429 = too fast
         self.retry_after = retry_after  # seconds to wait when code == 429
+        # network=True: we never got an answer (no internet, timeout, dropped connection)
+        self.network = network
+        # maybe_sent=True: the request may have reached Telegram before the answer
+        # was lost, so re-sending a MESSAGE could deliver it twice.
+        self.maybe_sent = maybe_sent
+
+    @property
+    def temporary(self) -> bool:
+        """True for problems that usually go away by themselves (network, 429, Telegram 5xx)."""
+        return self.network or self.code == 429 or (self.code or 0) >= 500
 
 
 class TelegramBot:
@@ -76,17 +101,20 @@ class TelegramBot:
             try:
                 data = json.loads(e.read().decode("utf-8"))
             except Exception:
-                raise TelegramError(f"HTTP {e.code}: {e.reason}", code=e.code) from e
+                raise TelegramError(f"HTTP {e.code}: {e.reason} ({method})", code=e.code) from e
         except urllib.error.URLError as e:
-            raise TelegramError(f"Network error: {e.reason}") from e
+            # Failed while CONNECTING: the request never reached Telegram, safe to retry.
+            raise TelegramError(f"Network error: {e.reason} ({method})", network=True) from e
         except (socket.timeout, TimeoutError) as e:  # socket.timeout != TimeoutError on Python < 3.10
-            raise TelegramError("Network timeout") from e
+            # Connected, but no answer in `timeout` seconds. Telegram may have done it anyway.
+            raise TelegramError(f"Network timeout after {timeout}s ({method})",
+                                network=True, maybe_sent=True) from e
         except (OSError, http.client.HTTPException) as e:
             # Errors while READING the reply (connection reset, SSL error,
             # truncated response) are not wrapped in URLError by urllib.
-            raise TelegramError(f"Network error: {e!r}") from e
+            raise TelegramError(f"Network error: {e!r} ({method})", network=True, maybe_sent=True) from e
         except ValueError as e:  # reply was not JSON (e.g. a proxy error page)
-            raise TelegramError(f"Bad reply from Telegram: {e}") from e
+            raise TelegramError(f"Bad reply from Telegram ({method}): {e}", network=True, maybe_sent=True) from e
 
         if not isinstance(data, dict):
             raise TelegramError("Bad reply from Telegram")
@@ -136,14 +164,22 @@ class TelegramBot:
     def get_chat(self, chat_id: Any) -> Dict[str, Any]:
         return self.call("getChat", {"chat_id": chat_id})
 
+    def get_chat_member(self, chat_id: Any, user_id: int) -> Dict[str, Any]:
+        return self.call("getChatMember", {"chat_id": chat_id, "user_id": user_id})
+
     def get_webhook_url(self) -> str:
         return (self.call("getWebhookInfo") or {}).get("url", "")
 
     # ------------------------------------------------------------------
     # Join requests
     # ------------------------------------------------------------------
-    def get_updates(self, offset: Optional[int], timeout: int = 20) -> List[Dict[str, Any]]:
-        """Waits up to `timeout` seconds for new join requests."""
+    def get_updates(self, offset: Optional[int], timeout: int = 10) -> List[Dict[str, Any]]:
+        """
+        Waits up to `timeout` seconds for new join requests (long polling).
+        Kept short (10 s): some routers/NATs/VPS firewalls silently drop a
+        connection that is idle for ~20+ seconds, which shows up as
+        "Network timeout" on longer polls.
+        """
         params: Dict[str, Any] = {"timeout": timeout, "allowed_updates": ["chat_join_request"]}
         if offset is not None:
             params["offset"] = offset
@@ -210,14 +246,24 @@ class TelegramBot:
                                              "message_ids": message_ids}, timeout=120)
 
     @staticmethod
-    def file_id_of(message: Dict[str, Any]) -> Optional[str]:
-        """Returns the reusable file_id from a sent message (largest photo size)."""
+    def file_kind_and_id(message: Dict[str, Any]):
+        """
+        Returns (kind, file_id) of the file in a sent message, e.g.
+        ("photo", "AgAC…") using the largest photo size, or ("", None).
+        The kind is what Telegram actually STORED, which can differ from what
+        was sent (a .wav sent as audio may come back as a document).
+        """
         if message.get("photo"):
-            return message["photo"][-1]["file_id"]
+            return "photo", message["photo"][-1]["file_id"]
         for key in ("video", "audio", "animation", "document"):
             if message.get(key):
-                return message[key]["file_id"]
-        return None
+                return key, message[key]["file_id"]
+        return "", None
+
+    @staticmethod
+    def file_id_of(message: Dict[str, Any]) -> Optional[str]:
+        """Returns the reusable file_id from a sent message (largest photo size)."""
+        return TelegramBot.file_kind_and_id(message)[1]
 
 
 def guess_kind(path: str) -> str:

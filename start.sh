@@ -4,6 +4,7 @@
 #
 #     ./start.sh            open the window (or server mode if there's no screen)
 #     ./start.sh --server   no window: run only the join-request bot (for a VPS)
+#     ./start.sh --check    test the connection to Telegram + the bot's admin rights
 #
 # If you get "Permission denied", run it as:   bash start.sh
 #
@@ -103,6 +104,11 @@ if [ "$VPY" != "$PYTHON" ]; then
 fi
 
 # ---------- 4. window or server mode? ----------
+# --check only tests the connection + bot rights; it must NOT close the running bot
+if [ "${1:-}" = "--check" ]; then
+  exec "$VPY" server.py --check
+fi
+
 MODE="window"
 [ "${1:-}" = "--server" ] && MODE="server"
 
@@ -125,12 +131,28 @@ proc_dir() {  # working folder of a process
   if [ -e "/proc/$1/cwd" ]; then readlink "/proc/$1/cwd"            # Linux
   else lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p'; fi  # macOS
 }
-for pid in $(pgrep -f "app.py|server.py" 2>/dev/null); do
+# Only Python running app.py / server.py (not e.g. `nano server.py`), and
+# never a `--check` run.
+for pid in $(pgrep -f "[Pp]ython[0-9.]*[^ ]* .*(app|server)\.py" 2>/dev/null); do
   [ "$pid" = "$$" ] && continue
+  case "$(ps -o args= -p "$pid" 2>/dev/null)" in *--check*) continue ;; esac
   if [ "$(proc_dir "$pid")" = "$APP_DIR" ]; then
     say "Closing the copy that is already running (PID $pid)…"
     kill "$pid" 2>/dev/null
-    sleep 1
+    # Wait until it has really exited (it finishes its current request and
+    # tells Telegram where it stopped: up to ~10 s). Starting earlier gives
+    # "409 Conflict" and could handle the same request twice.
+    waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+      if [ "$waited" -ge 40 ]; then
+        warn "Old copy (PID $pid) didn't stop in 40 s; forcing it."
+        kill -9 "$pid" 2>/dev/null
+        sleep 1
+        break
+      fi
+      sleep 1
+      waited=$((waited + 1))
+    done
   fi
 done
 

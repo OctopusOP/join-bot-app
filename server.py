@@ -6,6 +6,7 @@ greeting, save the users. Logs are printed to the terminal.
 
     ./start.sh --server        (recommended: sets everything up first)
     python3 server.py          (direct)
+    python3 server.py --check  (test connection + bot rights, then exit)
 
 It uses the same settings.json as the window app. Easiest setup:
   1. Set the token, channel and greeting in the window app on your PC.
@@ -45,11 +46,81 @@ def report(kind: str, text: str) -> None:
     mark = {"ok": "✓", "error": "✖", "info": "·"}.get(kind, "·")
     try:
         print(f"{COLORS.get(kind, '')}{datetime.now():%Y-%m-%d %H:%M:%S}  {mark} {text}\033[0m", flush=True)
-    except (BrokenPipeError, OSError):
-        pass  # terminal closed (e.g. SSH disconnected): keep the bot running anyway
+    except (OSError, ValueError):
+        # Terminal closed (SSH disconnected), or it can't show some character.
+        # Logging must NEVER stop the bot.
+        pass
+
+
+def _safe_output() -> None:
+    """Non-UTF-8 terminals/log files (LANG=C, PYTHONIOENCODING=ascii): show
+    '?' for characters like ✓ or emoji names instead of crashing."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")  # Python 3.7+
+        except (AttributeError, ValueError):
+            pass
+
+
+def check() -> int:
+    """
+    `python3 server.py --check`: tests the connection to Telegram and the
+    bot's rights, and says what to fix. Doesn't read or approve any requests.
+    """
+    import socket
+    from telegram_api import TelegramBot, TelegramError
+    from workers import bot_rights_problem
+
+    host, ok = "api.telegram.org", True
+    print(f"1. Reaching {host} (port 443):")
+    for family, label in ((socket.AF_INET, "IPv4"), (socket.AF_INET6, "IPv6")):
+        try:
+            addr = socket.getaddrinfo(host, 443, family, socket.SOCK_STREAM)[0][4]
+        except socket.gaierror:
+            print(f"   {label}: no address (fine if the other one works)")
+            continue
+        start = time.time()
+        try:
+            with socket.create_connection(addr[:2], timeout=5):
+                print(f"   {label}: OK in {(time.time() - start) * 1000:.0f} ms ({addr[0]})")
+        except OSError as e:
+            print(f"   {label}: FAILED ({e})")
+            if label == "IPv6":
+                print("         -> start the bot with  JOINBOT_IPV4=1 bash start.sh --server")
+
+    settings = storage.load_settings()
+    if not settings.get("token"):
+        print("2. No bot token in settings.json.")
+        return 1
+    bot = TelegramBot(settings["token"])
+    print("2. Bot API calls:")
+    try:
+        start = time.time()
+        me = bot.get_me()
+        print(f"   getMe: @{me['username']} in {(time.time() - start) * 1000:.0f} ms")
+        if bot.get_webhook_url():
+            print("   PROBLEM: a webhook is set, so this bot can't read join requests here.")
+            ok = False
+        chat = bot.get_chat(settings["channel"])
+        print(f"   channel: “{chat.get('title')}” (ID {chat['id']})")
+        problem = bot_rights_problem(bot, chat["id"], me["id"])
+        print(f"   PROBLEM: {problem}" if problem else "   rights: admin with “Invite users via link” ✓")
+        ok = ok and not problem
+    except TelegramError as e:
+        print(f"   FAILED: {e}")
+        return 1
+    pending = storage.load_pending_approvals()
+    if pending:
+        print(f"3. {len(pending)} approval(s) are waiting to be retried: "
+              + ", ".join(str(p.get("name")) for p in pending[:5]))
+    print("\nAll good." if ok else "\nFix the PROBLEM line(s) above.")
+    return 0 if ok else 1
 
 
 def main() -> None:
+    _safe_output()
+    if "--check" in sys.argv[1:]:
+        sys.exit(check())
     settings = storage.load_settings()
     if not settings.get("token") or not settings.get("channel"):
         print(f"settings.json has no bot token / channel yet ({storage.SETTINGS_FILE}).\n"
@@ -65,7 +136,7 @@ def main() -> None:
     def stop(*_):
         nonlocal stopped_by_user
         stopped_by_user = True
-        report("info", "Stopping… (up to 20 seconds)")
+        report("info", "Stopping… (up to 10 seconds)")
         worker.stop()
 
     signal.signal(signal.SIGINT, stop)

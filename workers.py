@@ -13,6 +13,7 @@ function the GUI gives them (the GUI shows it in its log).
 
 import html
 import os
+import re
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
@@ -39,25 +40,69 @@ def personalize(text: str, user: Dict[str, Any], channel_title: str) -> str:
         "{user_id}": str(user.get("id") or user.get("user_id") or ""),
         "{channel}": channel_title or "",
     }
-    for key, val in values.items():
-        text = text.replace(key, html.escape(str(val), quote=False))
-    return text
+    # One pass, so a value is never itself treated as a placeholder
+    # (a user named "{channel}" must stay "{channel}").
+    return _PLACEHOLDER.sub(
+        lambda m: html.escape(str(values[m.group(0)]), quote=False) if m.group(0) in values else m.group(0),
+        text)
 
 
-def _with_retry(call: Callable[[], Any], attempts: int = 4) -> Any:
+_PLACEHOLDER = re.compile(r"\{\w+\}")
+
+
+def _with_retry(call: Callable[[], Any], attempts: int = 4, safe_to_repeat: bool = False) -> Any:
     """
-    Runs ONE Telegram call, waiting and retrying when Telegram says "too fast"
-    (429). Retrying single calls (not a whole greeting) means nobody gets the
-    same message twice.
+    Runs ONE Telegram call and retries it when that is safe:
+      - 429 "too fast": always (Telegram did nothing, it says how long to wait)
+      - network error while connecting: always (the request never arrived)
+      - network timeout / Telegram 5xx: only if `safe_to_repeat`, because the
+        request may have worked and a message would arrive twice. Approving a
+        join request twice is harmless, so approvals pass safe_to_repeat=True.
+    Retrying single calls (not a whole greeting) means nobody gets duplicates.
     """
+    delay = 2.0
     for attempt in range(attempts):
         try:
             return call()
         except TelegramError as e:
-            if e.code == 429 and attempt < attempts - 1:
+            if attempt == attempts - 1:
+                raise
+            if e.code == 429:
                 time.sleep(e.retry_after + 1)
-                continue
-            raise
+            elif e.network and (safe_to_repeat or not e.maybe_sent):
+                time.sleep(delay)
+                delay = min(delay * 2, 15)
+            elif (e.code or 0) >= 500 and safe_to_repeat:
+                time.sleep(delay)
+                delay = min(delay * 2, 15)
+            else:
+                raise
+
+
+# Errors from approveChatJoinRequest that mean "nothing left to do"
+ALREADY_HANDLED = ("USER_ALREADY_PARTICIPANT", "HIDE_REQUESTER_MISSING")
+PENDING_GIVE_UP = 24 * 3600  # stop retrying a failed approval after a day
+
+
+def bot_rights_problem(bot: TelegramBot, channel_id: Any, bot_user_id: int) -> str:
+    """
+    Approving join requests needs the bot to be an ADMIN with the
+    "Invite users via link" right. Returns a message saying what's wrong,
+    or "" when everything is fine (or it couldn't be checked).
+    """
+    try:
+        member = bot.get_chat_member(channel_id, bot_user_id)
+    except TelegramError:
+        return ""  # can't tell (network); approvals will show any real error
+    if member.get("status") == "creator":
+        return ""
+    if member.get("status") != "administrator":
+        return ("The bot is NOT an admin of this channel, so it can't approve join requests. "
+                "Channel → Administrators → add the bot with “Invite users via link”.")
+    if not member.get("can_invite_users"):
+        return ("The bot is an admin but lacks the “Invite users via link” (Add members) right, "
+                "so join requests can't be approved. Turn it on in Channel → Administrators → the bot.")
+    return ""
 
 
 def _file_cache_key(bot: TelegramBot, path: str) -> Optional[str]:
@@ -80,16 +125,19 @@ def _send_file_item(bot: TelegramBot, chat_id: Any, item: Dict[str, Any], captio
     key = _file_cache_key(bot, path)
     cached = storage.get_file_id(key) if key else ""
     if cached:
+        # Saved as "kind:file_id": Telegram may store e.g. a .wav sent as audio
+        # as a document, and a file_id only works with the method of its kind.
+        cached_kind, _, file_id = cached.rpartition(":")
         try:
-            _with_retry(lambda: bot.send_file(chat_id, kind, file_id=cached, caption=caption))
+            _with_retry(lambda: bot.send_file(chat_id, cached_kind or kind, file_id=file_id, caption=caption))
             return
         except TelegramError as e:
             if e.code != 400:  # 400 = file_id no longer valid -> upload again below
                 raise
     msg = _with_retry(lambda: bot.send_file(chat_id, kind, path=path, caption=caption))
-    new_id = TelegramBot.file_id_of(msg or {})
+    stored_kind, new_id = TelegramBot.file_kind_and_id(msg or {})
     if new_id and key:
-        storage.remember_file_id(key, new_id)
+        storage.remember_file_id(key, f"{stored_kind}:{new_id}")
 
 
 def send_content(bot: TelegramBot, chat_id: Any, content: Dict[str, Any],
@@ -164,7 +212,7 @@ class JoinWorker:
         self.thread.start()
 
     def stop(self) -> None:
-        # The loop notices within ~20 seconds (the long-poll timeout)
+        # The loop notices within ~10 seconds (the long-poll timeout)
         self.running = False
 
     def _active(self, gen: int) -> bool:
@@ -222,8 +270,13 @@ class JoinWorker:
         # Two loops reading the same bot = Telegram "409 Conflict", so wait
         # for the old loop (after a quick Stop -> Start) to finish first.
         if previous and previous.is_alive():
-            self.report("info", "Waiting for the previous session to close…")
-            previous.join(timeout=40)
+            self.report("info", "Waiting for the previous session to finish its last request…")
+            # Wait until it's really gone (it may be uploading a big file); two
+            # loops at once would handle the same requests twice.
+            while previous.is_alive() and self._active(gen):
+                previous.join(timeout=1)
+            if not self._active(gen):
+                return
 
         settings = storage.load_settings()
         bot = TelegramBot(settings["token"])
@@ -236,13 +289,47 @@ class JoinWorker:
         channel_id = chat["id"]
         channel_title = chat.get("title", settings["channel"])
         self.report("ok", f"Watching join requests for “{channel_title}” as @{me['username']}")
+        problem = bot_rights_problem(bot, channel_id, me["id"])
+        if problem:
+            self._bump("errors")
+            self.report("error", problem)
+
+        if settings.get("auto_approve") and storage.load_pending_approvals():
+            self.report("info", f"{len(storage.load_pending_approvals())} approval(s) from earlier "
+                                "network trouble will be retried.")
 
         # ---- main loop ----
+        net_fails = 0          # network failures in a row
+        last_net_report = 0.0  # so a bad connection doesn't flood the log
         while self._active(gen):
+            if storage.load_settings().get("auto_approve"):
+                try:
+                    self._retry_pending(bot, channel_id)
+                except Exception as e:
+                    self.report("error", f"Retrying pending approvals failed: {e!r}")
             try:
-                updates = bot.get_updates(self.offset, timeout=20)
+                updates = bot.get_updates(self.offset, timeout=10)
+                if net_fails >= 3:
+                    self.report("ok", "Connection to Telegram is back.")
+                net_fails = 0
             except TelegramError as e:
+                if e.network or (e.code or 0) >= 500:
+                    # Unstable connection: harmless for getUpdates (Telegram keeps
+                    # the requests until we read them), so just reconnect quickly.
+                    net_fails += 1
+                    if net_fails >= 3 and time.time() - last_net_report > 300:
+                        last_net_report = time.time()
+                        self._bump("errors")
+                        self.report("error", f"Connection to Telegram keeps failing ({e}). Still retrying. "
+                                             "On a server, try: JOINBOT_IPV4=1 bash start.sh --server   "
+                                             "or run: python3 server.py --check")
+                    self._sleep(gen, min(2 * net_fails, 30))
+                    continue
                 self._bump("errors")
+                if e.code in (401, 404):
+                    # Token revoked/changed in @BotFather: retrying can't help
+                    self._fail(gen, f"Telegram rejected the bot token ({e}). Update it in settings.json / the ⚙ tab.")
+                    return
                 if e.code == 409:
                     # Telegram allows only ONE program to read a bot's updates at a time
                     if "webhook" in str(e).lower():
@@ -287,6 +374,12 @@ class JoinWorker:
     def _handle(self, bot: TelegramBot, request: Dict[str, Any], channel_id: int, channel_title: str) -> None:
         user = request["from"]
         name = f"{user.get('first_name', '')} (@{user.get('username') or '-'}, {user['id']})"
+
+        # Telegram re-sends requests we read but didn't confirm (app closed or
+        # killed mid-batch). Skip ones already handled so nobody is greeted twice.
+        request_key = f"{request['chat']['id']}:{user['id']}:{request.get('date', '')}"
+        if storage.was_request_handled(request_key):
+            return
         self._bump("requests")
 
         # Only the selected channel; any other chat is left untouched
@@ -308,23 +401,66 @@ class JoinWorker:
                     greeted = True
                     self._bump("greeted")
                     self.report("ok", f"Greeted {name}")
-                except (TelegramError, ValueError) as e:
+                except Exception as e:
+                    # ANY greeting problem (network, bad item in a hand-edited
+                    # settings.json, unreadable file…) must never skip the approval below
                     self._bump("errors")
-                    self.report("error", f"Greeting to {name} failed: {e}")
+                    self.report("error", f"Greeting to {name} failed: {e if isinstance(e, TelegramError) else repr(e)}")
 
         if settings.get("auto_approve"):
-            try:
-                _with_retry(lambda: bot.approve_join_request(channel_id, user["id"]))
-                self._bump("approved")
-                self.report("ok", f"Approved {name}")
-            except TelegramError as e:
-                if "USER_ALREADY_PARTICIPANT" in str(e) or "HIDE_REQUESTER_MISSING" in str(e):
-                    self.report("info", f"{name} was already handled")
-                else:
-                    self._bump("errors")
-                    self.report("error", f"Approve {name} failed: {e}")
+            self._approve(bot, channel_id, user["id"], name)
 
-        storage.add_subscriber(user, greeted)
+        try:
+            storage.add_subscriber(user, greeted)
+            storage.mark_request_handled(request_key)
+        except OSError as e:  # e.g. subscribers.json owned by root after a `sudo` run
+            self._bump("errors")
+            self.report("error", f"Could not save {name}: {e}")
+
+    # ---- approving, with a retry queue for network trouble ----
+    def _approve(self, bot: TelegramBot, channel_id: int, user_id: int, name: str,
+                 from_queue: bool = False) -> None:
+        """
+        Approves one request. A temporary failure (network, 429, Telegram 5xx)
+        puts it in pending_approvals.json, retried from the main loop, so a
+        bad moment on the network never leaves a request pending forever.
+        """
+        try:
+            # Few, quick retries here so the bot doesn't stall on one user;
+            # the queue keeps trying for longer.
+            _with_retry(lambda: bot.approve_join_request(channel_id, user_id),
+                        attempts=2 if from_queue else 3, safe_to_repeat=True)
+        except TelegramError as e:
+            if any(s in str(e) for s in ALREADY_HANDLED):
+                # Also what we get when an earlier try timed out but DID work
+                storage.drop_pending_approval(user_id)
+                self.report("info", f"{name} was already handled")
+            elif e.temporary:
+                first_fail = storage.queue_pending_approval(user_id, channel_id, name)
+                if first_fail:
+                    self._bump("errors")
+                    self.report("error", f"Approve {name} failed ({e}). Will keep retrying automatically.")
+            else:
+                storage.drop_pending_approval(user_id)
+                self._bump("errors")
+                self.report("error", f"Approve {name} failed: {e}")
+            return
+        storage.drop_pending_approval(user_id)
+        self._bump("approved")
+        self.report("ok", f"Approved {name}" + (" (after retrying)" if from_queue else ""))
+
+    def _retry_pending(self, bot: TelegramBot, channel_id: int) -> None:
+        """Retries approvals that failed because of network trouble (oldest first)."""
+        now = time.time()
+        for p in storage.due_pending_approvals(now):
+            if p.get("channel_id") != channel_id:
+                continue  # queued for a different channel (settings changed): leave it
+            if now - p.get("since", now) > PENDING_GIVE_UP:
+                storage.drop_pending_approval(p["user_id"])
+                self.report("error", f"Gave up approving {p.get('name')} after 24 h of failures. "
+                                     "Approve them by hand in Telegram.")
+                continue
+            self._approve(bot, channel_id, p["user_id"], p.get("name", str(p["user_id"])), from_queue=True)
 
 
 # =============================================================================
@@ -381,8 +517,12 @@ class BroadcastWorker:
                 send_content(bot, user["user_id"], content, user, channel_title, warn=warn)
                 sent += 1
             except TelegramError as e:
-                if e.code == 403:  # blocked the bot / deleted account
-                    storage.set_subscriber_status(user["user_id"], "blocked")
+                if e.code == 403:
+                    # "bot was blocked by the user" / "user is deactivated" -> blocked.
+                    # "bot can't initiate conversation" = the greeting never reached
+                    # them, so the bot was never allowed to message them: unreachable.
+                    status = "unreachable" if "initiate" in str(e).lower() else "blocked"
+                    storage.set_subscriber_status(user["user_id"], status)
                     blocked += 1
                 else:
                     failed += 1
@@ -393,7 +533,7 @@ class BroadcastWorker:
             self.on_progress(i, total, sent, failed + blocked)
             time.sleep(0.05)
 
-        self.report("ok", f"Broadcast done: {sent} sent, {blocked} blocked the bot, {failed} failed")
+        self.report("ok", f"Broadcast done: {sent} sent, {blocked} blocked/unreachable, {failed} failed")
 
 
 # =============================================================================

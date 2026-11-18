@@ -20,8 +20,11 @@ from typing import List, Tuple
 # Biggest range we accept in one line, to avoid accidental huge numbers
 MAX_RANGE = 1000
 
-_PRIVATE = re.compile(r"(?:https?://)?(?:www\.)?(?:t|telegram)\.me/c/(\d+)/(?:\d+/)?(\d+)(?:-(\d+))?")
-_PUBLIC = re.compile(r"(?:https?://)?(?:www\.)?(?:t|telegram)\.me/([A-Za-z][A-Za-z0-9_]{3,})/(?:\d+/)?(\d+)(?:-(\d+))?")
+# The link must END after the message number (or continue with ?query / #hash),
+# so typos like ".../55abc" are rejected instead of silently read as 55.
+_END = r"(?=$|[?#\s])"
+_PRIVATE = re.compile(r"(?:https?://)?(?:www\.)?(?:t|telegram)\.me/c/(\d+)/(?:\d+/)?(\d+)(?:-(\d+))?/?" + _END)
+_PUBLIC = re.compile(r"(?:https?://)?(?:www\.)?(?:t|telegram)\.me/([A-Za-z][A-Za-z0-9_]{3,})/(?:\d+/)?(\d+)(?:-(\d+))?/?" + _END)
 
 
 def parse_link(line: str) -> List[Tuple[str, int]]:

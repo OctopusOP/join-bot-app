@@ -42,6 +42,21 @@ bash start.sh --server   # no window: join-request bot only (VPS / SSH)
   work anywhere.
 - To keep server mode running after you log out: `nohup bash start.sh --server > bot.log 2>&1 &`
 
+## Troubleshooting
+
+Test the connection and the bot's rights (doesn't stop a running bot):
+
+```bash
+bash start.sh --check
+```
+
+| You see | What to do |
+| :-- | :-- |
+| Greeting arrives but the request is **not approved** | Run `--check`. The bot must be a channel **admin** with **Invite users via link**. Approvals that fail because of the network are saved in `pending_approvals.json` and retried automatically (also after a restart). |
+| `Connection to Telegram keeps failing` / `Network timeout` | The server's connection to Telegram is unstable. If `--check` shows **IPv6: FAILED**, start with `JOINBOT_IPV4=1 bash start.sh --server`. Short drops are retried by themselves. |
+| `409 Conflict` | Another program uses the same bot token. Stop it (only one copy per token). |
+| `Telegram rejected the bot token` | The token was revoked/changed in @BotFather. Put the new one in `settings.json`. |
+
 When copying this folder to another computer, leave out `.venv` and `__pycache__`.
 
 ## Telegram setup (one time)
@@ -60,4 +75,4 @@ When copying this folder to another computer, leave out `.venv` and `__pycache__
 | `workers.py` | Background jobs: join requests, broadcast, forward |
 | `telegram_api.py` | Minimal Telegram Bot API client |
 | `links.py` | Reads message links and ranges, groups them into batches |
-| `storage.py` | Saves `settings.json`, `subscribers.json`, `file_ids.json` |
+| `storage.py` | Saves `settings.json`, `subscribers.json`, `file_ids.json`, `pending_approvals.json`, `handled_requests.json` |

@@ -62,6 +62,7 @@ class ScrollFrame(ttk.Frame):
         # macOS + Windows send <MouseWheel>; Linux (X11) sends Button-4 (up) / Button-5 (down).
         self.canvas.bind("<Enter>", self._wheel_on)
         self.canvas.bind("<Leave>", self._wheel_off)
+        self.inner.bind("<Leave>", self._wheel_off)  # leaving via a row's edge
 
     def _wheel_on(self, _event=None):
         self.canvas.bind_all("<MouseWheel>", self._wheel)
@@ -69,6 +70,15 @@ class ScrollFrame(ttk.Frame):
         self.canvas.bind_all("<Button-5>", lambda e: self.canvas.yview_scroll(1, "units"))
 
     def _wheel_off(self, _event=None):
+        # Tk also sends <Leave> when the pointer moves onto a row INSIDE the
+        # list; keep scrolling working unless the pointer really left the list.
+        try:
+            x, y = self.winfo_pointerxy()
+            under = self.winfo_containing(x, y)
+        except (tk.TclError, KeyError):
+            under = None
+        if under is not None and str(under).startswith(str(self.canvas)):
+            return
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             self.canvas.unbind_all(seq)
 
@@ -355,6 +365,17 @@ class App(tk.Tk):
     def _drain_queue(self):
         """Runs every 100 ms: shows everything the background threads reported."""
         try:
+            self._show_events()
+        except Exception as e:  # never stop the 100 ms loop, or the window freezes its log/buttons
+            try:
+                self.log("error", f"Display error: {e!r}")
+            except Exception:
+                pass
+        finally:
+            self.after(100, self._drain_queue)
+
+    def _show_events(self):
+        try:
             while True:
                 event = self.events.get_nowait()
                 if event[0] == "log":
@@ -379,7 +400,6 @@ class App(tk.Tk):
         self.join_state.set("● Running" if self.join_worker.running else "○ Stopped")
         self.bc_cancel_btn.configure(state="normal" if self.broadcaster.running else "disabled")
         self.fw_cancel_btn.configure(state="normal" if self.forwarder.running else "disabled")
-        self.after(100, self._drain_queue)
 
     def run_in_background(self, job):
         """Runs `job()` in a thread; it reports via self.events."""
@@ -423,7 +443,7 @@ class App(tk.Tk):
     def toggle_join(self):
         if self.join_worker.running:
             self.join_worker.stop()
-            self.log("info", "Stopping… (finishes within ~20 seconds)")
+            self.log("info", "Stopping… (finishes within ~10 seconds)")
             return
         if not self.save_settings(quiet=True):
             return
